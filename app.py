@@ -281,6 +281,22 @@ def save_timetable():
         mongo.db.timetable.insert_one(data)
         return jsonify({"msg": "Timetable saved successfully!"}), 201
 
+@app.route("/get-attendance", methods=["GET"])
+@jwt_required()
+def get_attendance():
+    username = get_jwt_identity()  # Fetching username from JWT
+
+    print(f"Fetching attendance for user: {username}")  # Debugging log
+
+    # Fetch the student's attendance from the database
+    student_attendance = mongo.db.attendance.find_one({"username": username})
+    
+    if student_attendance:
+        print(f"Attendance found: {student_attendance['attendance']}")  # Debugging log
+        return jsonify({"attendance": student_attendance["attendance"]}), 200
+    else:
+        print("No attendance found for user")  # Debugging log
+        return jsonify({"attendance": []}), 404
 
 
 if __name__ == "__main__":
