@@ -4,19 +4,53 @@ from flask_jwt_extended import JWTManager, create_access_token, jwt_required, ge
 from dotenv import load_dotenv
 import bcrypt
 from datetime import timedelta
+from bson import ObjectId
 import os
 
 load_dotenv()
 
 app = Flask(__name__)
 
-# MongoDB Configuration - Using a separate database for SmartClassroom
-app.config["MONGO_URI"] = os.getenv("DB_CONNECTION_STRING") + "smartclassroom" 
+db_uri = "mongodb+srv://testpetition3:dJyxJFktJrqGxk0f@petition.fwrpa.mongodb.net/"
+db_name = "smartclassroom"
+
+if not db_uri.endswith("/"):
+    db_uri += "/"
+
+app.config["MONGO_URI"] = db_uri + db_name
 mongo = PyMongo(app)
 
 # JWT Configuration
-app.config["JWT_SECRET_KEY"] = os.getenv("JWT_SECRET")
+app.config["JWT_SECRET_KEY"] = "your_jwt_secret_key_here"
 jwt = JWTManager(app)
+
+
+@app.route("/store-facial-data", methods=["POST"])
+def store_facial_data():
+    data = request.get_json()
+
+    # Validate if student_id and images are present
+    if not data.get("studentId") or not data.get("images"):
+        return jsonify({"msg": "Student ID and images are required."}), 400
+
+    student_id = data["studentId"]
+    images = data["images"]  # List of base64 images
+
+    # Check if the student exists in the database
+    student = mongo.db.users.find_one({"_id": ObjectId(student_id), "type": "Student"})
+    if not student:
+        return jsonify({"msg": "Student not found."}), 400
+
+    # Save base64 images to the database (you can store them as a list of strings)  
+    student_face_data = {"faceImages": images}
+    
+    # Update the student record with the facial data
+    mongo.db.users.update_one(
+        {"_id": ObjectId(student_id)}, 
+        {"$set": student_face_data}
+    )
+
+    return jsonify({"msg": "Facial data stored successfully."}), 200
 
 @app.route("/signup", methods=["POST"])
 def signup():
@@ -59,9 +93,13 @@ def signup():
         user_data.update(student_details)
 
     # Insert user data into the smartclassroom database
-    mongo.db.users.insert_one(user_data)
+    result = mongo.db.users.insert_one(user_data)
 
-    return jsonify({"msg": "User created successfully!"}), 201
+    # Get the generated studentId (or MongoDB ObjectId)
+    student_id = str(result.inserted_id)
+
+    return jsonify({"msg": "User created successfully!", "studentId": student_id}), 201
+
 
 
 @app.route("/login", methods=["POST"])
@@ -88,35 +126,25 @@ def login():
 @app.route("/mark-attendance", methods=["POST"])
 @jwt_required()
 def mark_attendance():
-    username = get_jwt_identity()
+    username = get_jwt_identity()  # Get the JWT token from the request
     data = request.get_json()
 
-    # Check if the class number is provided
+    # Get class number and image from the request data
     class_number = data.get("class_number")
-    if not class_number:
-        return jsonify({"msg": "Class number is required."}), 400
+    image = data.get("image")
 
-    # Find the student in the database
+    if not class_number or not image:
+        return jsonify({"msg": "Class number and image are required."}), 400  # Change this to 400
+
+    # Check if the image is base64
+    if not image.startswith("data:image") or not isinstance(image, str):
+        return jsonify({"msg": "Invalid image format."}), 400  # Change this to 400
+
+    # Fetch the student and attendance data as before
     student = mongo.db.users.find_one({"username": username, "type": "Student"})
     if not student:
         return jsonify({"msg": "Student not found."}), 404
 
-    # Fetch current attendance data from the database
-    student_attendance = mongo.db.attendance.find_one({"username": username})
-    
-    if student_attendance:
-        # Check if the attendance for the class has already been marked
-        if class_number in student_attendance["attendance"]:
-            return jsonify({"msg": f"Attendance for Class {class_number} is already marked."}), 400
-        
-        # Add the new class to the attendance list
-        student_attendance["attendance"].append(class_number)
-        mongo.db.attendance.update_one({"username": username}, {"$set": {"attendance": student_attendance["attendance"]}})
-    else:
-        # If attendance is not found, create a new record
-        mongo.db.attendance.insert_one({"username": username, "attendance": [class_number]})
-
-    return jsonify({"msg": f"Attendance for Class {class_number} marked."}), 200
 
 @app.route("/students", methods=["GET"])
 @jwt_required()
