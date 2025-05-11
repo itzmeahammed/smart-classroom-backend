@@ -5,6 +5,7 @@ from dotenv import load_dotenv
 import bcrypt
 from datetime import timedelta
 from bson import ObjectId
+import base64
 import os
 
 load_dotenv()
@@ -27,27 +28,27 @@ jwt = JWTManager(app)
 
 @app.route("/store-facial-data", methods=["POST"])
 def store_facial_data():
-    data = request.get_json()
-
-    # Validate if student_id and images are present
-    if not data.get("studentId") or not data.get("images"):
+    student_id = request.form.get("studentId")
+    if not student_id or 'images' not in request.files:
         return jsonify({"msg": "Student ID and images are required."}), 400
 
-    student_id = data["studentId"]
-    images = data["images"]  # List of base64 images
-
-    # Check if the student exists in the database
+    # Fetch student
     student = mongo.db.users.find_one({"_id": ObjectId(student_id), "type": "Student"})
     if not student:
         return jsonify({"msg": "Student not found."}), 400
 
-    # Save base64 images to the database (you can store them as a list of strings)  
-    student_face_data = {"faceImages": images}
-    
-    # Update the student record with the facial data
+    # Handle multiple images
+    files = request.files.getlist("images")
+    encoded_images = []
+
+    for file in files:
+        img_bytes = file.read()
+        encoded = base64.b64encode(img_bytes).decode('utf-8')
+        encoded_images.append(encoded)
+
     mongo.db.users.update_one(
-        {"_id": ObjectId(student_id)}, 
-        {"$set": student_face_data}
+        {"_id": ObjectId(student_id)},
+        {"$set": {"faceImages": encoded_images}}
     )
 
     return jsonify({"msg": "Facial data stored successfully."}), 200
@@ -57,7 +58,6 @@ def signup():
     print("Received signup request") 
     data = request.get_json()
 
-    # Validate input fields for common fields
     if not data.get("username") or not data.get("password") or not data.get("name") or not data.get("type"):
         return jsonify({"msg": "All fields (username, password, name, type) are required."}), 400
 
@@ -66,7 +66,6 @@ def signup():
     name = data["name"]
     user_type = data["type"]
 
-    # Check if the username already exists
     existing_user = mongo.db.users.find_one({"username": username})
     if existing_user:
         return jsonify({"msg": "Username already exists"}), 400
@@ -92,7 +91,6 @@ def signup():
         }
         user_data.update(student_details)
 
-    # Insert user data into the smartclassroom database
     result = mongo.db.users.insert_one(user_data)
 
     # Get the generated studentId (or MongoDB ObjectId)
@@ -123,27 +121,43 @@ def login():
         return jsonify({"access_token": access_token, "user": user["type"], "username": user["username"]}), 200
     else:
         return jsonify({"msg": "Invalid credentials"}), 401
+    
 @app.route("/mark-attendance", methods=["POST"])
-@jwt_required()
 def mark_attendance():
-    username = get_jwt_identity()  # Get the JWT token from the request
     data = request.get_json()
-
-    # Get class number and image from the request data
+    # Extract username and class number from the request body
+    username = data.get("username")
     class_number = data.get("class_number")
-    image = data.get("image")
 
-    if not class_number or not image:
-        return jsonify({"msg": "Class number and image are required."}), 400  # Change this to 400
+    # Check if the class number and username are provided
+    if not username:
+        return jsonify({"msg": "Username is required."}), 400
 
-    # Check if the image is base64
-    if not image.startswith("data:image") or not isinstance(image, str):
-        return jsonify({"msg": "Invalid image format."}), 400  # Change this to 400
+    if not class_number:
+        return jsonify({"msg": "Class number is required."}), 400
 
-    # Fetch the student and attendance data as before
+    # Find the student in the database
     student = mongo.db.users.find_one({"username": username, "type": "Student"})
     if not student:
         return jsonify({"msg": "Student not found."}), 404
+
+    # Fetch current attendance data from the database
+    student_attendance = mongo.db.attendance.find_one({"username": username})
+    
+    if student_attendance:
+        # Check if the attendance for the class has already been marked
+        if class_number in student_attendance["attendance"]:
+            return jsonify({"msg": f"Attendance for Class {class_number} is already marked."}), 400
+        
+        # Add the new class to the attendance list
+        student_attendance["attendance"].append(class_number)
+        mongo.db.attendance.update_one({"username": username}, {"$set": {"attendance": student_attendance["attendance"]}})
+    else:
+        # If attendance is not found, create a new record
+        mongo.db.attendance.insert_one({"username": username, "attendance": [class_number]})
+
+    return jsonify({"msg": f"Attendance for Class {class_number} marked."}), 200
+
 
 
 @app.route("/students", methods=["GET"])
@@ -262,6 +276,10 @@ def get_quiz_results():
     
     return jsonify(results_list), 200
 
+UPLOAD_FOLDER = './uploads'
+if not os.path.exists(UPLOAD_FOLDER):
+    os.makedirs(UPLOAD_FOLDER)
+
 @app.route("/upload-study-material", methods=["POST"])
 def upload_study_material():
     data = request.get_json()
@@ -270,17 +288,40 @@ def upload_study_material():
         return jsonify({"msg": "File name and file data are required."}), 400
 
     file_name = data['name']
-    file_data = data['file']
+    file_data = data['file']  # Base64 encoded file data
 
-    # Store the file in MongoDB as Base64
-    study_material = {
-        "name": file_name,
-        "file": file_data  # Store Base64 encoded file
-    }
+    # Decode the Base64 file data
+    file_content = base64.b64decode(file_data.split(',')[1])  # Remove data URL prefix if present
 
-    mongo.db.study_materials.insert_one(study_material)
+    # Save the file to the server
+    file_path = os.path.join(UPLOAD_FOLDER, file_name)
+    
+    try:
+        with open(file_path, 'wb') as file:
+            file.write(file_content)
 
-    return jsonify({"msg": "Study material uploaded successfully!"}), 201
+        # Store the file metadata and file path in MongoDB
+        study_material = {
+            "name": file_name,
+            "file_path": file_path  # Storing the file path in the database
+        }
+
+        # Insert into MongoDB
+        mongo.db.study_materials.insert_one(study_material)
+
+        return jsonify({"msg": "Study material uploaded successfully!"}), 201
+
+    except Exception as e:
+        return jsonify({"msg": f"Failed to upload study material: {str(e)}"}), 500
+
+@app.route("/get-study-materials", methods=["GET"])
+def get_study_materials():
+    materials = mongo.db.study_materials.find()
+
+    # Prepare the list of study materials with file paths
+    materials_list = [{"name": material['name'], "file_path": material['file_path']} for material in materials]
+    
+    return jsonify({"study_materials": materials_list}), 200
 
 @app.route('/get-timetable', methods=['GET'])
 def get_timetable():
